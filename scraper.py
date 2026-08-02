@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Scraper des resultats de loterie — Cote d'Ivoire (Loto Bonheur / LONACI).
+Scraper des resultats de loterie — plateforme Ubiq.
+Couvre la Cote d'Ivoire (Loto Bonheur / LONACI) ET le Benin (LNB),
+qui partagent la meme API (memes donnees JSON).
 
-Principe :
-  1) Se connecte a Supabase avec le compte dedie du scraper.
-  2) Lit, dans la base, les tirages suivis pour la Cote d'Ivoire (avec leur heure).
-  3) Interroge l'API officielle du Loto Bonheur (donnees JSON propres).
-  4) Fait correspondre chaque resultat a un tirage PAR SON HEURE.
-  5) Ecrit les resultats dans la base (idempotent : re-ecrire n'abime rien).
-
-Aucune cle secrete dans ce fichier : seuls l'email et le mot de passe du
-scraper sont fournis par les "secrets" de GitHub (variables d'environnement).
+Principe pour CHAQUE pays :
+  1) Lit dans la base les tirages suivis (avec leur heure, en heure du Togo).
+  2) Interroge l'API du pays.
+  3) Fait correspondre chaque resultat PAR SON HEURE.
+     - Le Benin est en GMT+1 : on retire 1h pour passer en heure du Togo.
+     - Cas special : un tirage de minuit (00H Benin) devient 23h la veille (Togo).
+  4) Ecrit les resultats dans la base (idempotent).
 """
 
 import os
@@ -22,7 +22,6 @@ from datetime import date, timedelta
 import requests
 from supabase import create_client
 
-# --- Connexion Supabase : URL + cle PUBLIQUE (sans danger, deja publiques sur le site) ---
 SUPABASE_URL = "https://iviyzfaqinkoiiaylvdn.supabase.co"
 SUPABASE_ANON_KEY = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
@@ -30,23 +29,20 @@ SUPABASE_ANON_KEY = (
     "QjUUBPDwu0HGYl33jYVlktYXLQvLBqC0U58Sgp_QLxc"
 )
 
-# --- Identifiants du scraper : fournis par les secrets GitHub (jamais ecrits ici) ---
 EMAIL = os.environ.get("SCRAPER_EMAIL", "")
 PASSWORD = os.environ.get("SCRAPER_PASSWORD", "")
 
-COUNTRY_CODE = "CI"
-DAYS_BACK = 3  # on traite les resultats des 3 derniers jours
-MONTHS_FR = [
-    "janvier", "fevrier", "mars", "avril", "mai", "juin",
-    "juillet", "aout", "septembre", "octobre", "novembre", "decembre",
-]
-# L'API attend le mois en francais avec accents ; on garde une version accentuee.
+DAYS_BACK = 3
 MONTHS_FR_ACCENTS = [
     "janvier", "f\u00e9vrier", "mars", "avril", "mai", "juin",
     "juillet", "ao\u00fbt", "septembre", "octobre", "novembre", "d\u00e9cembre",
 ]
 
-API_URL = "https://lotobonheur.ci/api/results"
+COUNTRIES = [
+    {"code": "CI", "api": "https://lotobonheur.ci/api/results"},
+    {"code": "BJ", "api": "https://www.lnbloto.bj/api/results"},
+]
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,7 +57,6 @@ def log(*a):
 
 
 def parse_numbers(s):
-    """'12 - 45 - 07 - 88 - 23' -> [12, 45, 7, 88, 23] ; ignore les points et vides."""
     out = []
     for part in str(s).replace("\u2013", "-").split("-"):
         part = part.strip()
@@ -71,46 +66,24 @@ def parse_numbers(s):
 
 
 def hour_from_name(name):
-    """Extrait l'heure d'un nom de tirage : 'Digital Reveil 8h' -> 8."""
     m = re.search(r"(\d{1,2})\s*[hH]", str(name))
     return int(m.group(1)) if m else None
 
 
-def main():
-    if not EMAIL or not PASSWORD:
-        log("ERREUR : identifiants manquants (secrets SCRAPER_EMAIL / SCRAPER_PASSWORD).")
-        sys.exit(1)
+def process_country(sb, cfg, today):
+    code = cfg["code"]
+    log("\n----- Pays : %s -----" % code)
 
-    log("=== Scraper Cote d'Ivoire ===")
-    sb = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-    # 1) Connexion du scraper
-    try:
-        auth = sb.auth.sign_in_with_password({"email": EMAIL, "password": PASSWORD})
-        if not getattr(auth, "session", None):
-            log("ERREUR : connexion refusee (verifie l'email / mot de passe du scraper).")
-            sys.exit(1)
-        try:
-            sb.postgrest.auth(auth.session.access_token)
-        except Exception:
-            pass  # selon la version, le jeton est deja pris en compte automatiquement
-        log("Connexion Supabase : OK")
-    except Exception as e:
-        log("ERREUR de connexion Supabase :", repr(e))
-        sys.exit(1)
-
-    # 2) Pays + decalage horaire
     countries = (
-        sb.table("countries").select("id,code,tz_offset").eq("code", COUNTRY_CODE).execute().data
+        sb.table("countries").select("id,code,tz_offset").eq("code", code).execute().data
     )
     if not countries:
-        log(f"ERREUR : pays {COUNTRY_CODE} introuvable dans la base.")
-        sys.exit(1)
+        log("  Pays %s introuvable dans la base, on passe." % code)
+        return
     country_id = countries[0]["id"]
     tz_offset = countries[0].get("tz_offset") or 0
-    log(f"Pays {COUNTRY_CODE} : id={country_id}, decalage horaire={tz_offset}h")
+    log("  id=%s | decalage horaire=%sh" % (country_id, tz_offset))
 
-    # 3) Nos tirages suivis (heure -> tirage)
     draws = (
         sb.table("draws").select("id,name,hour")
         .eq("country_id", country_id).eq("active", True).execute().data
@@ -121,37 +94,36 @@ def main():
             hour_to_draw[int(round(float(d["hour"])))] = d
         except Exception:
             pass
-    log(f"Tirages suivis ({len(hour_to_draw)}) : "
-        + ", ".join(f"{h}h={d['name']}" for h, d in sorted(hour_to_draw.items())))
+    log("  Tirages suivis : " + ", ".join(
+        "%sh=%s" % (h, d["name"]) for h, d in sorted(hour_to_draw.items())))
     if not hour_to_draw:
-        log("Aucun tirage suivi pour ce pays. Rien a faire.")
+        log("  Aucun tirage suivi pour ce pays, on passe.")
         return
 
-    # 4) Appel de l'API Loto Bonheur (mois courant)
-    today = date.today()
-    month_year = f"{MONTHS_FR_ACCENTS[today.month - 1]} {today.year}"
-    params = {"monthYear": month_year, "drawType": "Tous les tirages"}
-    log(f"Appel API : {API_URL} (mois : {month_year})")
+    month_year = "%s %s" % (MONTHS_FR_ACCENTS[today.month - 1], today.year)
     try:
-        r = requests.get(API_URL, params=params, headers=HEADERS, timeout=25)
-        log("Statut HTTP :", r.status_code)
+        r = requests.get(
+            cfg["api"],
+            params={"monthYear": month_year, "drawType": "Tous les tirages"},
+            headers=HEADERS, timeout=25,
+        )
+        log("  API %s -> HTTP %s (mois : %s)" % (cfg["api"], r.status_code, month_year))
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        log("ERREUR lors de l'appel API :", repr(e))
-        sys.exit(1)
+        log("  ERREUR API %s : %r (on passe au pays suivant)" % (code, e))
+        return
 
     weeks = data.get("drawsResultsWeekly", []) if isinstance(data, dict) else []
-    log(f"Semaines de resultats recues : {len(weeks)}")
+    log("  Semaines de resultats recues : %s" % len(weeks))
 
     recent = {today - timedelta(days=i) for i in range(DAYS_BACK)}
-    seen = 0
     written = 0
+    unmatched = {}
 
     for week in weeks:
         for day in week.get("drawResultsDaily", []):
-            date_str = day.get("date", "")  # ex. "samedi 09/05"
-            m = re.search(r"(\d{1,2})/(\d{1,2})", date_str)
+            m = re.search(r"(\d{1,2})/(\d{1,2})", day.get("date", ""))
             if not m:
                 continue
             dd, mm = int(m.group(1)), int(m.group(2))
@@ -169,41 +141,80 @@ def main():
                 win_raw = draw.get("winningNumbers", "")
                 if not name or name == "-" or not win_raw or win_raw.strip().startswith("."):
                     continue
-                seen += 1
-
                 win = parse_numbers(win_raw)
                 if len(win) != 5:
                     continue
                 mac = parse_numbers(draw.get("machineNumbers", ""))
 
                 src_hour = hour_from_name(name)
-                if src_hour is None:
-                    continue
-                togo_hour = src_hour - tz_offset  # Cote d'Ivoire : decalage = 0
-                match = hour_to_draw.get(togo_hour)
+                d_result = d_obj
+                togo_hour = None
+                if src_hour is not None:
+                    togo_hour = src_hour - tz_offset
+                    if togo_hour < 0:
+                        togo_hour += 24
+                        d_result = d_obj - timedelta(days=1)
+
+                match = hour_to_draw.get(togo_hour) if togo_hour is not None else None
                 if not match:
-                    continue  # tirage non suivi pour ce pays
+                    unmatched[name] = src_hour
+                    continue
 
                 row = {
                     "country_id": country_id,
                     "draw_id": match["id"],
                     "draw_name": match["name"],
-                    "draw_date": d_obj.isoformat(),
+                    "draw_date": d_result.isoformat(),
                     "winning_numbers": win,
                     "machine_numbers": mac if len(mac) == 5 else None,
                     "status": "published",
-                    "source": "scraper-lotobonheur",
+                    "source": "scraper-%s" % code,
                 }
                 try:
                     sb.table("results").upsert(row, on_conflict="draw_id,draw_date").execute()
                     written += 1
-                    log(f"  ecrit : {d_obj.isoformat()} | {match['name']} ({src_hour}h) | {win}"
-                        + (f" | machine {mac}" if len(mac) == 5 else ""))
+                    log("  ecrit : %s | %s | %s%s" % (
+                        d_result.isoformat(), match["name"], win,
+                        (" | machine %s" % mac) if len(mac) == 5 else ""))
                 except Exception as e:
-                    log(f"  ECHEC ecriture {match['name']} {d_obj.isoformat()} :", repr(e))
+                    log("  ECHEC ecriture %s %s : %r" % (match["name"], d_result.isoformat(), e))
 
-    log(f"=== Termine : {seen} tirages lus (fenetre {DAYS_BACK} jours), "
-        f"{written} resultats ecrits/mis a jour. ===")
+    log("  => %s resultats ecrits/mis a jour pour %s." % (written, code))
+    if unmatched:
+        parts = "; ".join("'%s' (heure=%s)" % (n, h) for n, h in unmatched.items())
+        log("  (Tirages lus mais non suivis, pour info : %s)" % parts)
+
+
+def main():
+    if not EMAIL or not PASSWORD:
+        log("ERREUR : identifiants manquants (secrets SCRAPER_EMAIL / SCRAPER_PASSWORD).")
+        sys.exit(1)
+
+    log("=== Scraper multi-pays (Cote d'Ivoire + Benin) ===")
+    sb = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+    try:
+        auth = sb.auth.sign_in_with_password({"email": EMAIL, "password": PASSWORD})
+        if not getattr(auth, "session", None):
+            log("ERREUR : connexion refusee (verifie l'email / mot de passe du scraper).")
+            sys.exit(1)
+        try:
+            sb.postgrest.auth(auth.session.access_token)
+        except Exception:
+            pass
+        log("Connexion Supabase : OK")
+    except Exception as e:
+        log("ERREUR de connexion Supabase : %r" % e)
+        sys.exit(1)
+
+    today = date.today()
+    for cfg in COUNTRIES:
+        try:
+            process_country(sb, cfg, today)
+        except Exception as e:
+            log("ERREUR inattendue pour %s : %r" % (cfg["code"], e))
+
+    log("\n=== Termine. ===")
 
 
 if __name__ == "__main__":
