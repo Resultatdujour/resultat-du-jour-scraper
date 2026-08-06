@@ -1,76 +1,72 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Explorateur du backend Firebase de l'appli Neko Dev (avec son autorisation).
-But : decouvrir OU sont rangees les donnees et sous quelle forme.
-N'ecrit rien nulle part : il lit et affiche seulement, pour que je comprenne
-la structure, puis j'ecrirai le vrai scraper.
+Explorateur v2 du backend Neko Dev (avec autorisation).
+Se connecte comme le fait l'appli : en UTILISATEUR ANONYME (Firebase Auth),
+puis lit la Realtime Database avec le jeton obtenu.
+Ne modifie rien : lecture seule, affichage de la structure.
 """
 import json
 import requests
 
-HOSTING = "https://neko-dev-fireb.web.app"
-UA = {"User-Agent": "Mozilla/5.0 (compatible; explorer/1.0)"}
+API_KEY = "AIzaSyDwe96aJva0CeNYTG8C9OyIRXYgqVTN7YY"
+DB_URL = "https://neko-dev-fireb.firebaseio.com"
+UA = {"User-Agent": "Mozilla/5.0"}
 
 
 def log(*a):
     print(*a, flush=True)
 
 
-# 1) Recuperer la configuration Firebase (fournie par Firebase Hosting)
-log("=== 1) Configuration Firebase ===")
-cfg = {}
+# 1) Se connecter en anonyme (comme l'appli)
+log("=== 1) Connexion anonyme (comme l'appli) ===")
+token = None
 try:
-    r = requests.get(HOSTING + "/__/firebase/init.json", headers=UA, timeout=20)
-    log(HOSTING + "/__/firebase/init.json  ->  HTTP", r.status_code)
+    url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp"
+    r = requests.post(url, params={"key": API_KEY},
+                      json={"returnSecureToken": True}, headers=UA, timeout=20)
+    log("Connexion anonyme -> HTTP", r.status_code)
     if r.status_code == 200:
-        cfg = r.json()
-        log(json.dumps(cfg, indent=2))
+        j = r.json()
+        token = j.get("idToken")
+        log("Jeton obtenu : OUI (utilisateur anonyme cree)")
     else:
-        log("Contenu :", r.text[:500])
+        log("Reponse :", r.text[:600])
+        log(">>> Si erreur 'ADMIN_ONLY_OPERATION' ou 'anonymous...disabled' :")
+        log(">>> la connexion anonyme est DESACTIVEE chez lui. Il faudra l'Option 1.")
 except Exception as e:
-    log("Erreur config :", repr(e))
+    log("Erreur connexion :", repr(e))
 
-project_id = cfg.get("projectId")
-db_url = cfg.get("databaseURL")
-api_key = cfg.get("apiKey")
-log("\nprojectId =", project_id, "|  databaseURL =", db_url)
 
-# 2) Realtime Database : structure (sans tout telecharger)
-log("\n=== 2) Realtime Database (structure) ===")
-if db_url:
+def read(path, shallow=False):
+    params = {}
+    if token:
+        params["auth"] = token
+    if shallow:
+        params["shallow"] = "true"
+    return requests.get(DB_URL + path + ".json", params=params, headers=UA, timeout=20)
+
+
+# 2) Lire la racine (structure de 1er niveau)
+log("\n=== 2) Structure de la base (avec le jeton) ===")
+try:
+    top = read("/", shallow=True)
+    log("Racine -> HTTP", top.status_code)
+    log(top.text[:2000])
+    keys = []
     try:
-        top = requests.get(db_url + "/.json", params={"shallow": "true"}, headers=UA, timeout=20)
-        log("Racine (cles de 1er niveau) -> HTTP", top.status_code)
-        log(top.text[:1500])
-        keys = []
-        try:
-            j = top.json()
-            if isinstance(j, dict):
-                keys = list(j.keys())
-        except Exception:
-            pass
-        for k in keys[:12]:
-            sub = requests.get(db_url + "/" + k + ".json", params={"shallow": "true"}, headers=UA, timeout=20)
-            log("  /" + str(k) + "  -> HTTP", sub.status_code, ":", sub.text[:700])
-    except Exception as e:
-        log("Erreur RTDB :", repr(e))
-else:
-    log("(pas de databaseURL dans la config -> probablement Firestore)")
+        j = top.json()
+        if isinstance(j, dict):
+            keys = list(j.keys())
+    except Exception:
+        pass
 
-# 3) Firestore : liste des collections racine
-log("\n=== 3) Firestore (collections) ===")
-if project_id:
-    try:
-        url = ("https://firestore.googleapis.com/v1/projects/" + project_id
-               + "/databases/(default)/documents:listCollectionIds")
-        params = {"key": api_key} if api_key else {}
-        r = requests.post(url, params=params, json={}, headers=UA, timeout=20)
-        log("listCollectionIds -> HTTP", r.status_code)
-        log(r.text[:1500])
-    except Exception as e:
-        log("Erreur Firestore :", repr(e))
-else:
-    log("(pas de projectId -> impossible de tester Firestore)")
+    # 3) Explorer chaque branche de 1er niveau (juste les cles)
+    for k in keys[:15]:
+        sub = read("/" + k, shallow=True)
+        log("\n  /" + str(k) + "  -> HTTP", sub.status_code)
+        log("   cles :", sub.text[:900])
+except Exception as e:
+    log("Erreur lecture :", repr(e))
 
-log("\n=== Fin de l'exploration ===")
+log("\n=== Fin ===")
